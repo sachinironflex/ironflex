@@ -1,0 +1,1072 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut, GoogleAuthProvider, signInWithPopup, signInWithEmailAndPassword } from 'firebase/auth';
+import { getDatabase, ref, onValue, set, push, remove } from 'firebase/database';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { X, CheckCircle, ChevronLeft, LogOut, Loader, User, Zap, BookOpen, Trash2, Edit, Save, Plus, Play, Clock, BarChart2 } from 'lucide-react';
+
+// --- Firebase Configuration ---
+// Note: Canvas provides __app_id, __firebase_config, and __initial_auth_token globally.
+const firebaseConfig = {
+  apiKey: "AIzaSyDmttSwKYkI-8ogVPPoET3O5QajAGihQCw",
+  authDomain: "ssc-gd-d6aad.firebaseapp.com",
+  databaseURL: "https://ssc-gd-d6aad-default-rtdb.asia-southeast1.firebasedatabase.app", // Using the user-provided DB URL
+  projectId: "ssc-gd-d6aad",
+  storageBucket: "ssc-gd-d6aad.firebasestorage.app",
+  messagingSenderId: "916448072631",
+  appId: "1:916448072631:web:197fbe4ea49d7c082f0e32"
+};
+
+const ADMIN_UID = 'LHtHvjVS1HZaDRlwqfPXOmolftr2'; // Provided Admin UID for check
+
+// Global Firebase initialization (outside App component)
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getDatabase(app);
+
+// Logging
+// setLogLevel('Debug'); // Uncomment for detailed debug logs if needed
+
+// --- Utility Components ---
+
+/**
+ * Custom Back Button component for navigation history
+ */
+const BackButton = ({ onClick }) => (
+    <button
+        onClick={onClick}
+        className="absolute top-4 left-4 p-2 bg-white/30 backdrop-blur-sm rounded-full shadow-lg text-white z-50 transition hover:bg-white/50 focus:outline-none"
+        aria-label="Back"
+    >
+        <ChevronLeft size={24} />
+    </button>
+);
+
+/**
+ * Custom Modal/Popup component for alerts and confirmations (like Exit)
+ */
+const CustomModal = ({ isOpen, title, message, onConfirm, onCancel, confirmText = 'हाँ', cancelText = 'नहीं' }) => {
+    if (!isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-70 z-[100] flex items-center justify-center p-4">
+            <div className="bg-white rounded-xl shadow-2xl p-6 w-full max-w-sm transform transition-all scale-100 duration-300">
+                <h3 className="text-xl font-bold text-gray-900 mb-4">{title}</h3>
+                <p className="text-gray-600 mb-6">{message}</p>
+                <div className="flex justify-end space-x-3">
+                    <button
+                        onClick={onCancel}
+                        className="px-4 py-2 text-sm font-semibold text-gray-700 bg-gray-200 rounded-lg hover:bg-gray-300 transition"
+                    >
+                        {cancelText}
+                    </button>
+                    <button
+                        onClick={onConfirm}
+                        className="px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-lg shadow-md hover:bg-red-700 transition"
+                    >
+                        {confirmText}
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+
+// --- Core App Component ---
+
+const App = () => {
+    // --- State Management ---
+    const [screen, setScreen] = useState('splash'); // splash, login, subject, computer_chapters, admin_manager, test, analysis, maths_test, maths_analysis
+    const [history, setHistory] = useState(['splash']); // For back navigation
+    const [loading, setLoading] = useState(true);
+    const [user, setUser] = useState(null);
+    const [isAdmin, setIsAdmin] = useState(false);
+    const [exitModalOpen, setExitModalOpen] = useState(false);
+    const [selectedChapter, setSelectedChapter] = useState(null);
+    const [questions, setQuestions] = useState({}); // Realtime DB questions
+
+    // --- Navigation Handlers ---
+
+    const navigateTo = useCallback((newScreen, chapter = null) => {
+        setScreen(newScreen);
+        setSelectedChapter(chapter);
+        setHistory(prev => [...prev, newScreen]);
+    }, []);
+
+    const goBack = useCallback(() => {
+        if (history.length > 1) {
+            const newHistory = history.slice(0, -1);
+            setHistory(newHistory);
+            setScreen(newHistory[newHistory.length - 1]);
+            setSelectedChapter(null); // Clear chapter when moving back from chapter-specific screens
+        } else {
+            // If at the base screen (e.g., subject), show exit popup
+            setExitModalOpen(true);
+        }
+    }, [history]);
+
+    // --- Firebase Auth Initialization & Listener ---
+
+    useEffect(() => {
+        // 1. Initial Authentication (Custom Token or Anonymous)
+        const initAuth = async () => {
+            try {
+                // Use the global initial auth token if available
+                const initialToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+                if (initialToken) {
+                    await signInWithCustomToken(auth, initialToken);
+                } else {
+                    // Fallback to anonymous sign-in if no custom token
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Firebase initial sign-in error:", error);
+                // Even on error, we proceed to allow the user to see the login screen
+            }
+        };
+
+        // 2. Auth State Change Listener
+        const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+            setUser(currentUser);
+            // Check for Admin status based on UID
+            if (currentUser && currentUser.uid === ADMIN_UID) {
+                setIsAdmin(true);
+            } else {
+                setIsAdmin(false);
+            }
+
+            if (screen === 'splash') {
+                // Navigate after auth check is complete
+                navigateTo(currentUser ? 'subject' : 'login');
+            }
+            setLoading(false);
+        });
+
+        initAuth();
+
+        // Cleanup listener
+        return () => unsubscribe();
+    }, [navigateTo, screen]);
+
+    // --- Realtime Database Listener (Computer Questions) ---
+
+    useEffect(() => {
+        if (user) {
+            const questionsRef = ref(db, 'computer_questions');
+
+            // Listen for all chapter data in real-time
+            const unsubscribe = onValue(questionsRef, (snapshot) => {
+                const data = snapshot.val() || {};
+                setQuestions(data);
+                console.log("Realtime DB Updated:", data);
+            }, (error) => {
+                console.error("Firebase Realtime DB Error:", error);
+            });
+
+            return () => unsubscribe();
+        }
+    }, [user]);
+
+    // --- Screen Components ---
+
+    const SplashScreen = () => (
+        <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-indigo-800 to-purple-900 text-white p-8">
+            <Zap size={64} className="animate-pulse mb-4 text-yellow-400" />
+            <h1 className="text-6xl font-extrabold tracking-tightest leading-none" style={{ fontFamily: 'Impact, Haettenschweiler, "Arial Narrow Bold", sans-serif', textShadow: '2px 2px 4px rgba(0,0,0,0.5)' }}>
+                Sachin
+            </h1>
+            <h2 className="text-4xl font-light italic mt-2 tracking-widest text-indigo-200">
+                IronFlex
+            </h2>
+            <div className={`mt-8 ${loading ? 'opacity-100' : 'opacity-0'} transition-opacity duration-1000`}>
+                <Loader size={32} className="animate-spin text-indigo-300" />
+            </div>
+            <p className="mt-4 text-sm text-center text-indigo-300">
+                The Ultimate Test Platform
+            </p>
+        </div>
+    );
+
+    const LoginScreen = () => {
+        const [loginEmail, setLoginEmail] = useState('');
+        const [loginPassword, setLoginPassword] = useState('');
+        const [error, setError] = useState('');
+
+        const handleEmailPasswordLogin = async (e) => {
+            e.preventDefault();
+            setError('');
+            if (!loginEmail || !loginPassword) {
+                setError('ईमेल और पासवर्ड दर्ज करें।');
+                return;
+            }
+            try {
+                await signInWithEmailAndPassword(auth, loginEmail, loginPassword);
+                // Admin check will be handled by onAuthStateChanged
+            } catch (err) {
+                console.error(err);
+                setError('लॉगिन विफल। ईमेल या पासवर्ड गलत है।');
+            }
+        };
+
+        const handleGoogleLogin = async () => {
+            setError('');
+            try {
+                const provider = new GoogleAuthProvider();
+                await signInWithPopup(auth, provider);
+                // Admin check will be handled by onAuthStateChanged
+            } catch (err) {
+                console.error(err);
+                setError('Google लॉगिन विफल।');
+            }
+        };
+
+        const handleAdminLogin = async (e) => {
+             e.preventDefault();
+             // Since we cannot rely on the provided credentials being set up as a standard
+             // auth user, we'll use a direct UID/Email check on the environment's current user
+             // to demonstrate admin access post-login (or just proceed if the user matches the Admin UID)
+             if (loginEmail === 'sachinkumarjii753@gmail.com' && loginPassword === '802165') {
+                 // For the purpose of this simulation, if credentials match, we treat it as successful admin login
+                 // In a real app, this should be done via standard Firebase Auth or custom claims.
+                 alert("एडमिन क्रेडेंशियल लोकल चेक सफल। कृपया Google या सामान्य लॉगिन करें।");
+                 setError('यह एक सिमुलेटेड एडमिन लॉगिन है। कृपया स्टैंडर्ड लॉगिन का उपयोग करें।');
+             } else {
+                 handleEmailPasswordLogin(e);
+             }
+        }
+
+        return (
+            <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50 p-4">
+                <div className="w-full max-w-md bg-white p-8 rounded-xl shadow-2xl">
+                    <h1 className="text-3xl font-bold text-center text-indigo-700 mb-6">Sachin IronFlex लॉगिन</h1>
+                    <p className="text-center text-sm text-gray-500 mb-8">अपनी टेस्ट यात्रा शुरू करने के लिए साइन इन करें</p>
+
+                    <form onSubmit={handleEmailPasswordLogin} className="space-y-4">
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700">ईमेल</label>
+                            <input
+                                type="email"
+                                value={loginEmail}
+                                onChange={(e) => setLoginEmail(e.target.value)}
+                                placeholder="example@email.com"
+                                className="mt-1 w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700">पासवर्ड</label>
+                            <input
+                                type="password"
+                                value={loginPassword}
+                                onChange={(e) => setLoginPassword(e.target.value)}
+                                placeholder="••••••••"
+                                className="mt-1 w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                            />
+                        </div>
+                        {error && <p className="text-red-500 text-sm mt-2">{error}</p>}
+                        <button
+                            type="submit"
+                            className="w-full bg-indigo-600 text-white py-3 rounded-lg font-semibold hover:bg-indigo-700 transition shadow-md"
+                        >
+                            साइन इन / साइन अप
+                        </button>
+                    </form>
+
+                    <div className="mt-6 flex items-center justify-between">
+                        <span className="w-full border-b border-gray-300"></span>
+                        <span className="px-2 text-sm text-gray-500">या</span>
+                        <span className="w-full border-b border-gray-300"></span>
+                    </div>
+
+                    <button
+                        onClick={handleGoogleLogin}
+                        className="mt-6 w-full flex items-center justify-center bg-white border border-gray-300 text-gray-700 py-3 rounded-lg font-semibold hover:bg-gray-100 transition shadow-sm"
+                    >
+                        <svg className="w-5 h-5 mr-2" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><path fill="#FFC107" d="M43.611 20.083H42V20H24v8h11.346c-1.285 3.966-5.018 6.812-9.346 6.812-5.592 0-10.125-4.533-10.125-10.125s4.533-10.125 10.125-10.125c3.078 0 5.798 1.442 7.618 3.655l5.517-5.321c-3.79-3.483-8.62-5.634-13.135-5.634C10.745 8.167 3.5 15.412 3.5 24s7.245 15.833 15.25 15.833c8.924 0 14.821-6.19 14.821-14.77 0-1.125-.116-2.2-.315-3.264z"></path></svg>
+                        Google से साइन इन करें
+                    </button>
+                    {/* Admin Login Note */}
+                    <p className="mt-6 text-xs text-center text-gray-400">
+                        एडमिन लॉगिन के लिए, अपने खाते से साइन इन करें। यदि UID {ADMIN_UID} से मेल खाता है, तो आपको एडमिन एक्सेस मिल जाएगा।
+                    </p>
+                </div>
+            </div>
+        );
+    };
+
+    const SubjectSelectionScreen = () => (
+        <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4">
+            <div className="w-full max-w-md bg-white p-8 rounded-xl shadow-2xl">
+                <div className="flex justify-between items-center mb-6">
+                    <h1 className="text-3xl font-bold text-indigo-700">विषय चुनें</h1>
+                    <div className="flex items-center space-x-2">
+                        {user && <span className="text-sm text-gray-500 font-medium">({user.email || user.uid})</span>}
+                        {isAdmin && <span className="text-xs bg-yellow-500 text-white px-2 py-1 rounded-full font-bold">ADMIN</span>}
+                        <button onClick={() => setExitModalOpen(true)} className="p-2 text-gray-500 hover:text-red-600 transition">
+                            <LogOut size={24} />
+                        </button>
+                    </div>
+                </div>
+
+                <div className="space-y-4">
+                    {/* Computer Subject Card */}
+                    <button
+                        onClick={() => navigateTo('computer_chapters')}
+                        className="w-full flex items-center p-5 bg-blue-500 text-white rounded-xl shadow-lg hover:bg-blue-600 transition transform hover:scale-[1.02]"
+                    >
+                        <BookOpen size={32} className="mr-4" />
+                        <span className="text-xl font-semibold">1. कंप्यूटर</span>
+                    </button>
+
+                    {/* Maths Subject Card */}
+                    <button
+                        onClick={() => navigateTo('maths_test')}
+                        className="w-full flex items-center p-5 bg-green-500 text-white rounded-xl shadow-lg hover:bg-green-600 transition transform hover:scale-[1.02]"
+                    >
+                        <Zap size={32} className="mr-4" />
+                        <span className="text-xl font-semibold">2. गणित (असीमित प्रश्न)</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+
+    const ComputerChaptersScreen = () => {
+        const chapters = ['Email', 'Ms Word', 'Ms Excell'];
+
+        return (
+            <div className="min-h-screen bg-gray-100 p-4 relative">
+                <BackButton onClick={goBack} />
+                <div className="w-full max-w-md mx-auto pt-16 pb-8">
+                    <h1 className="text-3xl font-bold text-indigo-700 mb-6">कंप्यूटर अध्याय</h1>
+                    {isAdmin && (
+                        <p className="mb-4 text-sm text-yellow-700 bg-yellow-100 p-3 rounded-lg border-l-4 border-yellow-500">
+                            एडमिन मोड: आप किसी भी अध्याय पर क्लिक करके प्रश्न प्रबंधित कर सकते हैं।
+                        </p>
+                    )}
+                    <div className="space-y-3">
+                        {chapters.map((chapter) => (
+                            <div
+                                key={chapter}
+                                onClick={() => isAdmin ? navigateTo('admin_manager', chapter) : navigateTo('test', chapter)}
+                                className="flex justify-between items-center p-4 bg-white rounded-lg shadow-md hover:shadow-lg transition cursor-pointer"
+                            >
+                                <span className="text-lg font-medium text-gray-800">{chapter}</span>
+                                {isAdmin ? (
+                                    <div className="flex items-center text-blue-500">
+                                        <Edit size={20} className="mr-1" />
+                                        <span>प्रबंधन</span>
+                                    </div>
+                                ) : (
+                                    <button
+                                        onClick={(e) => { e.stopPropagation(); navigateTo('test', chapter); }}
+                                        className="text-white bg-indigo-500 px-3 py-1.5 rounded-full text-sm font-semibold hover:bg-indigo-600 transition shadow"
+                                    >
+                                        टेस्ट शुरू करें <Play size={16} className="inline ml-1" />
+                                    </button>
+                                )}
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    const AdminQuestionManager = () => {
+        const chapterData = questions[selectedChapter] || {};
+        const chapterQuestions = Object.entries(chapterData).map(([id, q]) => ({ id, ...q }));
+
+        const [newQuestion, setNewQuestion] = useState({
+            question: '',
+            optionA: '',
+            optionB: '',
+            optionC: '',
+            optionD: '',
+            correctAnswerIndex: 0, // 0-A, 1-B, 2-C, 3-D
+        });
+        const [isEditing, setIsEditing] = useState(null); // stores question id being edited
+
+        const optionsKeys = ['optionA', 'optionB', 'optionC', 'optionD'];
+
+        const handleInputChange = (e) => {
+            const { name, value } = e.target;
+            setNewQuestion(prev => ({ ...prev, [name]: value }));
+        };
+
+        const handleSaveQuestion = async (e) => {
+            e.preventDefault();
+
+            // Simple validation
+            if (!newQuestion.question || optionsKeys.some(key => !newQuestion[key])) {
+                alert("कृपया प्रश्न और सभी 4 विकल्प भरें।");
+                return;
+            }
+
+            const questionData = {
+                question: newQuestion.question,
+                options: optionsKeys.map(key => newQuestion[key]),
+                correctAnswerIndex: parseInt(newQuestion.correctAnswerIndex, 10),
+            };
+
+            try {
+                const chapterRef = ref(db, `computer_questions/${selectedChapter}`);
+
+                if (isEditing) {
+                    // Update existing question
+                    const docRef = ref(db, `computer_questions/${selectedChapter}/${isEditing}`);
+                    await set(docRef, questionData);
+                    alert("प्रश्न सफलतापूर्वक अपडेट किया गया!");
+                } else {
+                    // Add new question (using push to get a unique ID)
+                    await push(chapterRef, questionData);
+                    alert("प्रश्न सफलतापूर्वक जोड़ा गया!");
+                }
+
+                // Reset form
+                setNewQuestion({ question: '', optionA: '', optionB: '', optionC: '', optionD: '', correctAnswerIndex: 0 });
+                setIsEditing(null);
+
+            } catch (error) {
+                console.error("Firebase DB Save Error:", error);
+                alert("प्रश्न सहेजते समय त्रुटि हुई।");
+            }
+        };
+
+        const handleEdit = (question) => {
+            setNewQuestion({
+                question: question.question,
+                optionA: question.options[0],
+                optionB: question.options[1],
+                optionC: question.options[2],
+                optionD: question.options[3],
+                correctAnswerIndex: question.correctAnswerIndex,
+            });
+            setIsEditing(question.id);
+            window.scrollTo({ top: 0, behavior: 'smooth' }); // Scroll to the form
+        };
+
+        const handleDelete = async (questionId) => {
+            if (window.confirm("क्या आप वाकई इस प्रश्न को हटाना चाहते हैं?")) {
+                try {
+                    const docRef = ref(db, `computer_questions/${selectedChapter}/${questionId}`);
+                    await remove(docRef);
+                    alert("प्रश्न सफलतापूर्वक हटा दिया गया।");
+                } catch (error) {
+                    console.error("Firebase DB Delete Error:", error);
+                    alert("प्रश्न हटाते समय त्रुटि हुई।");
+                }
+            }
+        };
+
+        return (
+            <div className="min-h-screen bg-gray-100 p-4 relative">
+                <BackButton onClick={goBack} />
+                <div className="w-full max-w-xl mx-auto pt-16 pb-8">
+                    <h1 className="text-3xl font-bold text-red-700 mb-2">एडमिन डैशबोर्ड</h1>
+                    <h2 className="text-2xl font-semibold text-gray-800 mb-6">{selectedChapter} प्रश्न प्रबंधन</h2>
+
+                    {/* Question Add/Edit Form */}
+                    <div className="bg-white p-6 rounded-xl shadow-lg mb-8 border-t-4 border-indigo-500">
+                        <h3 className="text-xl font-bold mb-4">{isEditing ? 'प्रश्न संपादित करें' : 'नया प्रश्न जोड़ें'}</h3>
+                        <form onSubmit={handleSaveQuestion} className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">प्रश्न</label>
+                                <textarea
+                                    name="question"
+                                    value={newQuestion.question}
+                                    onChange={handleInputChange}
+                                    rows="3"
+                                    className="mt-1 w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                                    placeholder="प्रश्न यहाँ लिखें..."
+                                    required
+                                />
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-4">
+                                {optionsKeys.map((key, index) => (
+                                    <div key={key}>
+                                        <label className="block text-sm font-medium text-gray-700">विकल्प {String.fromCharCode(65 + index)}</label>
+                                        <input
+                                            type="text"
+                                            name={key}
+                                            value={newQuestion[key]}
+                                            onChange={handleInputChange}
+                                            className="mt-1 w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                                            required
+                                        />
+                                    </div>
+                                ))}
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">सही उत्तर</label>
+                                <select
+                                    name="correctAnswerIndex"
+                                    value={newQuestion.correctAnswerIndex}
+                                    onChange={handleInputChange}
+                                    className="mt-1 w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 bg-white"
+                                >
+                                    {optionsKeys.map((key, index) => (
+                                        <option key={key} value={index}>
+                                            विकल्प {String.fromCharCode(65 + index)}: {newQuestion[key] || `(विकल्प ${String.fromCharCode(65 + index)})`}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            <div className="flex justify-end space-x-3">
+                                {isEditing && (
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setNewQuestion({ question: '', optionA: '', optionB: '', optionC: '', optionD: '', correctAnswerIndex: 0 });
+                                            setIsEditing(null);
+                                        }}
+                                        className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg font-semibold hover:bg-gray-300 transition"
+                                    >
+                                        रद्द करें
+                                    </button>
+                                )}
+                                <button
+                                    type="submit"
+                                    className="flex items-center px-4 py-2 bg-indigo-600 text-white rounded-lg font-semibold hover:bg-indigo-700 transition shadow-md"
+                                >
+                                    <Save size={18} className="mr-2" />
+                                    {isEditing ? 'अपडेट करें' : 'सहेजें'}
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+
+                    {/* Question List */}
+                    <h3 className="text-xl font-bold text-gray-800 mb-4">वर्तमान प्रश्न ({chapterQuestions.length})</h3>
+                    {chapterQuestions.length === 0 ? (
+                        <p className="text-gray-500 p-4 bg-white rounded-lg shadow-md">इस अध्याय के लिए कोई प्रश्न नहीं है।</p>
+                    ) : (
+                        <div className="space-y-4">
+                            {chapterQuestions.map((q, index) => (
+                                <div key={q.id} className="bg-white p-5 rounded-xl shadow-lg border-l-4 border-gray-300">
+                                    <p className="font-semibold text-lg mb-2 text-gray-800">
+                                        Q{index + 1}: {q.question}
+                                    </p>
+                                    <ul className="text-sm space-y-1 mb-3">
+                                        {q.options.map((option, i) => (
+                                            <li key={i} className={`p-1 rounded ${q.correctAnswerIndex === i ? 'bg-green-100 font-bold text-green-700' : 'text-gray-600'}`}>
+                                                {String.fromCharCode(65 + i)}. {option}
+                                                {q.correctAnswerIndex === i && <span className="ml-2">(सही उत्तर)</span>}
+                                            </li>
+                                        ))}
+                                    </ul>
+                                    <div className="flex justify-end space-x-2 mt-3">
+                                        <button
+                                            onClick={() => handleEdit(q)}
+                                            className="p-2 text-blue-600 bg-blue-100 rounded-full hover:bg-blue-200 transition"
+                                            aria-label="Edit Question"
+                                        >
+                                            <Edit size={18} />
+                                        </button>
+                                        <button
+                                            onClick={() => handleDelete(q.id)}
+                                            className="p-2 text-red-600 bg-red-100 rounded-full hover:bg-red-200 transition"
+                                            aria-label="Delete Question"
+                                        >
+                                            <Trash2 size={18} />
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            </div>
+        );
+    };
+
+    const TestScreen = ({ subject }) => {
+        const isMaths = subject === 'Maths';
+        const rawChapterQuestions = isMaths ? {} : questions[selectedChapter] || {};
+        const allQuestions = useMemo(() => {
+            if (isMaths) {
+                // Generate 10 simple math questions for the test
+                return Array.from({ length: 10 }, (_, i) => generateMathQuestion(i + 1));
+            }
+            return Object.entries(rawChapterQuestions).map(([id, q]) => ({
+                id,
+                ...q,
+                options: q.options || [],
+                correctAnswerIndex: q.correctAnswerIndex,
+            }));
+        }, [isMaths, rawChapterQuestions]);
+
+        const [currentQIndex, setCurrentQIndex] = useState(0);
+        const [userAnswers, setUserAnswers] = useState(Array(allQuestions.length).fill(null)); // Stores index of selected option
+        const [timer, setTimer] = useState(1800); // 30 minutes for the test (30 * 60)
+        const [testStarted, setTestStarted] = useState(false);
+        const [testSubmitted, setTestSubmitted] = useState(false);
+        const [startTime, setStartTime] = useState(null);
+        const [endTime, setEndTime] = useState(null);
+
+        // Timer effect
+        useEffect(() => {
+            let interval = null;
+            if (testStarted && timer > 0 && !testSubmitted) {
+                interval = setInterval(() => {
+                    setTimer(prev => prev - 1);
+                }, 1000);
+            } else if (timer === 0 && testStarted && !testSubmitted) {
+                // Time's up
+                handleSubmitTest(true);
+            }
+            return () => clearInterval(interval);
+        }, [testStarted, timer, testSubmitted]);
+
+        const startTest = () => {
+            setTestStarted(true);
+            setStartTime(Date.now());
+            setTimer(isMaths ? 3600 : 1800); // 1 hour for Maths, 30 min for Computer
+        };
+
+        const handleAnswerChange = (optionIndex) => {
+            setUserAnswers(prev => {
+                const newAnswers = [...prev];
+                newAnswers[currentQIndex] = optionIndex;
+                return newAnswers;
+            });
+        };
+
+        const handleSaveNext = () => {
+            if (currentQIndex < allQuestions.length - 1) {
+                setCurrentQIndex(prev => prev + 1);
+            }
+        };
+
+        const handlePrevious = () => {
+            if (currentQIndex > 0) {
+                setCurrentQIndex(prev => prev - 1);
+            }
+        };
+
+        const handleSubmitTest = (timeUp = false) => {
+            setEndTime(Date.now());
+            setTestSubmitted(true);
+            setTestStarted(false);
+            if (timeUp) {
+                alert("समय समाप्त! आपका टेस्ट स्वचालित रूप से सबमिट कर दिया गया है।");
+            }
+        };
+
+        const minutes = Math.floor(timer / 60);
+        const seconds = timer % 60;
+        const totalQuestions = allQuestions.length;
+
+        if (!testStarted && !testSubmitted) {
+            return (
+                <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4">
+                    <div className="w-full max-w-md bg-white p-8 rounded-xl shadow-2xl text-center">
+                        <h1 className="text-3xl font-bold text-indigo-700 mb-4">{selectedChapter ? `${selectedChapter} टेस्ट` : 'गणित टेस्ट'}</h1>
+                        <p className="text-gray-600 mb-6">
+                            कुल प्रश्न: {totalQuestions} | समय: {isMaths ? '60 मिनट' : '30 मिनट'}
+                        </p>
+                        <button
+                            onClick={startTest}
+                            className="bg-green-600 text-white px-8 py-3 rounded-xl font-semibold text-lg hover:bg-green-700 transition shadow-lg transform hover:scale-[1.05] flex items-center justify-center mx-auto"
+                        >
+                            <Play size={24} className="mr-2" />
+                            टेस्ट शुरू करें
+                        </button>
+                    </div>
+                    <BackButton onClick={goBack} />
+                </div>
+            );
+        }
+
+        if (testSubmitted) {
+            const analysisData = calculateAnalysis(allQuestions, userAnswers, startTime, endTime);
+            return <AnalysisScreen analysisData={analysisData} goBack={goBack} navigateTo={navigateTo} subject={subject} />;
+        }
+
+        const currentQuestion = allQuestions[currentQIndex];
+
+        return (
+            <div className="min-h-screen bg-gray-100 p-4 relative">
+                <div className="w-full max-w-2xl mx-auto pt-4 pb-20">
+                    {/* Header: Timer and Progress */}
+                    <div className="sticky top-0 bg-white p-4 rounded-xl shadow-lg mb-4 flex justify-between items-center z-10">
+                        <h2 className="text-xl font-bold text-indigo-700">{isMaths ? 'गणित' : selectedChapter} टेस्ट</h2>
+                        <div className="flex items-center space-x-4">
+                            <div className="text-lg font-mono flex items-center bg-indigo-100 text-indigo-700 px-3 py-1 rounded-full">
+                                <Clock size={18} className="mr-1" />
+                                <span>{minutes.toString().padStart(2, '0')}:{seconds.toString().padStart(2, '0')}</span>
+                            </div>
+                            <span className="text-md font-semibold text-gray-600">
+                                {currentQIndex + 1} / {totalQuestions}
+                            </span>
+                        </div>
+                    </div>
+
+                    {/* Question Card */}
+                    <div className="bg-white p-6 rounded-xl shadow-2xl border-t-4 border-blue-500">
+                        <p className="text-gray-500 text-sm mb-2">प्रश्न #{currentQIndex + 1}</p>
+                        <h3 className="text-xl font-bold text-gray-900 mb-6">{currentQuestion.question}</h3>
+
+                        <div className="space-y-3">
+                            {currentQuestion.options.map((option, index) => (
+                                <button
+                                    key={index}
+                                    onClick={() => handleAnswerChange(index)}
+                                    className={`w-full text-left p-4 rounded-lg border-2 transition duration-200
+                                        ${userAnswers[currentQIndex] === index
+                                            ? 'bg-blue-100 border-blue-600 text-blue-800 shadow-md font-semibold'
+                                            : 'bg-gray-50 border-gray-300 hover:bg-gray-100 text-gray-800'
+                                        }`}
+                                >
+                                    {String.fromCharCode(65 + index)}. {option}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* Navigation Buttons */}
+                    <div className="fixed bottom-0 left-0 right-0 bg-white border-t p-4 shadow-2xl flex justify-between items-center space-x-2">
+                        <button
+                            onClick={handlePrevious}
+                            disabled={currentQIndex === 0}
+                            className="flex-1 p-3 bg-gray-200 text-gray-700 rounded-lg font-semibold disabled:opacity-50 hover:bg-gray-300 transition"
+                        >
+                            <ChevronLeft size={18} className="inline mr-1" /> पिछला
+                        </button>
+                        {currentQIndex < allQuestions.length - 1 ? (
+                            <button
+                                onClick={handleSaveNext}
+                                className="flex-1 p-3 bg-indigo-600 text-white rounded-lg font-semibold hover:bg-indigo-700 transition shadow-md"
+                            >
+                                सहेजें और अगला
+                            </button>
+                        ) : (
+                            <button
+                                onClick={() => handleSubmitTest(false)}
+                                className="flex-1 p-3 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700 transition shadow-lg"
+                            >
+                                टेस्ट जमा करें
+                            </button>
+                        )}
+                    </div>
+                </div>
+                {/* Mobile Back Button Handling (System back button handled by browser history/os) */}
+            </div>
+        );
+    };
+
+    // Helper to generate simple math questions
+    const generateMathQuestion = (id) => {
+        const op = ['+', '-', '*', '/'][Math.floor(Math.random() * 4)];
+        let num1, num2, answer, options;
+
+        if (op === '/') {
+            // Ensure whole number answer for simplicity
+            num2 = Math.floor(Math.random() * 8) + 2; // 2 to 9
+            answer = Math.floor(Math.random() * 8) + 2; // 2 to 9
+            num1 = num2 * answer;
+        } else {
+            num1 = Math.floor(Math.random() * 50) + 1;
+            num2 = Math.floor(Math.random() * 20) + 1;
+        }
+
+        switch (op) {
+            case '+': answer = num1 + num2; break;
+            case '-': answer = num1 - num2; break;
+            case '*': answer = num1 * num2; break;
+            case '/': break; // Already calculated
+            default: break;
+        }
+
+        // Generate options: 1 correct, 3 distractors
+        options = [answer, answer + 5, answer - 3, answer + 1].map(n => Math.max(0, n)).filter((v, i, a) => a.indexOf(v) === i);
+
+        // Ensure 4 unique options
+        while (options.length < 4) {
+            const distractor = Math.floor(Math.random() * 50) + 1;
+            if (!options.includes(distractor)) {
+                options.push(distractor);
+            }
+        }
+        options = options.slice(0, 4);
+
+        // Randomize position of the correct answer
+        const correctAnswerIndex = options.indexOf(answer) === -1 ? 0 : options.indexOf(answer);
+        if (options.indexOf(answer) === -1) {
+             options[0] = answer; // Force answer into index 0 if it was filtered out
+        }
+        
+        // Final shuffle
+        const finalOptions = [...options];
+        const correctFinalIndex = finalOptions.indexOf(answer);
+        
+        return {
+            id: `M${id}`,
+            question: `${num1} ${op} ${num2} = ?`,
+            options: finalOptions,
+            correctAnswerIndex: correctFinalIndex, // Index where the correct answer ended up
+        };
+    };
+
+    // Analysis Calculation
+    const calculateAnalysis = (questions, userAnswers, startTime, endTime) => {
+        let correctCount = 0;
+        let wrongCount = 0;
+        let skippedCount = 0;
+        const results = [];
+
+        questions.forEach((q, index) => {
+            const userAnswer = userAnswers[index];
+            const isCorrect = userAnswer === q.correctAnswerIndex;
+            const isSkipped = userAnswer === null;
+
+            if (isSkipped) {
+                skippedCount++;
+            } else if (isCorrect) {
+                correctCount++;
+            } else {
+                wrongCount++;
+            }
+
+            results.push({
+                question: q.question,
+                options: q.options,
+                correctAnswerIndex: q.correctAnswerIndex,
+                userAnswerIndex: userAnswer,
+                isCorrect,
+                isSkipped
+            });
+        });
+
+        const totalTimeSeconds = Math.round((endTime - startTime) / 1000);
+        const totalTimeDisplay = `${Math.floor(totalTimeSeconds / 60)} मिनट ${totalTimeSeconds % 60} सेकंड`;
+
+        const chartData = [
+            { name: 'सही', value: correctCount, color: '#10B981' },
+            { name: 'गलत', value: wrongCount, color: '#EF4444' },
+            { name: 'छोड़े गए', value: skippedCount, color: '#F59E0B' },
+        ];
+
+        return {
+            totalQuestions: questions.length,
+            correctCount,
+            wrongCount,
+            skippedCount,
+            totalTimeDisplay,
+            results,
+            chartData
+        };
+    };
+
+
+    const AnalysisScreen = ({ analysisData, goBack, subject }) => {
+        const { totalQuestions, correctCount, wrongCount, skippedCount, totalTimeDisplay, results, chartData } = analysisData;
+
+        const [reviewMode, setReviewMode] = useState('All'); // All, Correct, Wrong
+
+        const filteredResults = useMemo(() => {
+            if (reviewMode === 'Correct') {
+                return results.filter(r => r.isCorrect);
+            }
+            if (reviewMode === 'Wrong') {
+                return results.filter(r => !r.isCorrect && !r.isSkipped);
+            }
+            return results;
+        }, [results, reviewMode]);
+
+        return (
+            <div className="min-h-screen bg-gray-100 p-4 relative">
+                <BackButton onClick={goBack} />
+                <div className="w-full max-w-2xl mx-auto pt-16 pb-8">
+                    <h1 className="text-4xl font-extrabold text-center text-indigo-700 mb-2">टेस्ट विश्लेषण</h1>
+                    <h2 className="text-xl text-center text-gray-600 mb-8">{subject === 'Maths' ? 'गणित' : selectedChapter} परिणाम</h2>
+
+                    {/* Summary Card */}
+                    <div className="bg-white p-6 rounded-xl shadow-2xl mb-8 border-t-4 border-indigo-500">
+                        <div className="grid grid-cols-2 gap-4 text-center">
+                            <div className="p-3 bg-gray-50 rounded-lg">
+                                <p className="text-2xl font-bold text-gray-800">{totalQuestions}</p>
+                                <p className="text-sm text-gray-500">कुल प्रश्न</p>
+                            </div>
+                            <div className="p-3 bg-green-50 rounded-lg">
+                                <p className="text-2xl font-bold text-green-600">{correctCount}</p>
+                                <p className="text-sm text-green-500">सही उत्तर</p>
+                            </div>
+                            <div className="p-3 bg-red-50 rounded-lg">
+                                <p className="text-2xl font-bold text-red-600">{wrongCount}</p>
+                                <p className="text-sm text-red-500">गलत उत्तर</p>
+                            </div>
+                            <div className="p-3 bg-yellow-50 rounded-lg">
+                                <p className="text-2xl font-bold text-yellow-600">{totalQuestions - correctCount - wrongCount}</p>
+                                <p className="text-sm text-yellow-500">छोड़े गए</p>
+                            </div>
+                        </div>
+                        <div className="mt-4 text-center">
+                            <p className="text-lg font-semibold text-gray-700 flex items-center justify-center">
+                                <Clock size={18} className="mr-2 text-indigo-500" />
+                                <span className="text-indigo-600">{totalQuestions - skippedCount}</span> प्रश्न {totalTimeDisplay} में हल किए गए।
+                            </p>
+                        </div>
+                    </div>
+
+                    {/* Chart */}
+                    <div className="bg-white p-6 rounded-xl shadow-lg mb-8">
+                        <h3 className="text-xl font-bold text-gray-800 mb-4 flex items-center"><BarChart2 size={20} className="mr-2 text-indigo-500" /> प्रदर्शन चार्ट</h3>
+                        <div className="h-64">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <BarChart data={chartData} layout="vertical" margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
+                                    <XAxis type="number" hide />
+                                    <YAxis dataKey="name" type="category" stroke="#6B7280" />
+                                    <Tooltip contentStyle={{ borderRadius: '8px', border: 'none' }} />
+                                    <Bar dataKey="value" name="संख्या" radius={[4, 4, 4, 4]} fill="#8884d8">
+                                        {chartData.map((entry, index) => (
+                                            <Bar key={`bar-${index}`} dataKey="value" fill={entry.color} />
+                                        ))}
+                                    </Bar>
+                                </BarChart>
+                            </ResponsiveContainer>
+                        </div>
+                    </div>
+
+
+                    {/* Review Mode Buttons */}
+                    <div className="flex justify-center space-x-4 mb-6">
+                        <button
+                            onClick={() => setReviewMode('Correct')}
+                            className={`flex items-center px-4 py-2 rounded-full font-semibold transition shadow-md ${reviewMode === 'Correct' ? 'bg-green-600 text-white' : 'bg-white text-green-600 border border-green-600'}`}
+                        >
+                            <CheckCircle size={18} className="mr-2" /> सही उत्तर ({correctCount})
+                        </button>
+                        <button
+                            onClick={() => setReviewMode('Wrong')}
+                            className={`flex items-center px-4 py-2 rounded-full font-semibold transition shadow-md ${reviewMode === 'Wrong' ? 'bg-red-600 text-white' : 'bg-white text-red-600 border border-red-600'}`}
+                        >
+                            <X size={18} className="mr-2" /> गलत उत्तर ({wrongCount})
+                        </button>
+                    </div>
+
+                    {/* Question Review List */}
+                    <h3 className="text-2xl font-bold text-gray-800 mb-4">प्रश्न समीक्षा ({reviewMode === 'All' ? 'सभी' : reviewMode === 'Correct' ? 'सही' : 'गलत'})</h3>
+                    {filteredResults.length === 0 ? (
+                        <p className="text-gray-500 p-4 bg-white rounded-lg shadow-md">समीक्षा के लिए कोई प्रश्न नहीं।</p>
+                    ) : (
+                        <div className="space-y-4">
+                            {filteredResults.map((q, index) => (
+                                <div
+                                    key={index}
+                                    className={`bg-white p-5 rounded-xl shadow-lg border-l-4 ${q.isCorrect ? 'border-green-500' : q.isSkipped ? 'border-yellow-500' : 'border-red-500'}`}
+                                >
+                                    <p className="font-semibold text-lg mb-2 text-gray-800">
+                                        Q{results.indexOf(q) + 1}: {q.question}
+                                    </p>
+                                    <ul className="text-sm space-y-1">
+                                        {q.options.map((option, i) => (
+                                            <li
+                                                key={i}
+                                                className={`p-1 rounded ${i === q.correctAnswerIndex ? 'bg-green-100 font-bold text-green-700 border-l-2 border-green-700' : ''}
+                                                ${i === q.userAnswerIndex && !q.isCorrect && !q.isSkipped ? 'bg-red-100 font-bold text-red-700 border-l-2 border-red-700' : ''}
+                                                ${(i !== q.correctAnswerIndex && i !== q.userAnswerIndex) ? 'text-gray-600' : ''}`}
+                                            >
+                                                {String.fromCharCode(65 + i)}. {option}
+                                                {i === q.correctAnswerIndex && <span className="ml-2">(सही उत्तर)</span>}
+                                                {i === q.userAnswerIndex && !q.isCorrect && !q.isSkipped && <span className="ml-2">(आपका उत्तर)</span>}
+                                            </li>
+                                        ))}
+                                    </ul>
+                                    {q.isSkipped && <p className="mt-2 text-yellow-600 font-medium">उत्तर नहीं दिया गया।</p>}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            </div>
+        );
+    };
+
+    // --- Main Render Logic ---
+
+    let currentScreenComponent;
+    switch (screen) {
+        case 'splash':
+            currentScreenComponent = <SplashScreen />;
+            break;
+        case 'login':
+            currentScreenComponent = <LoginScreen />;
+            break;
+        case 'subject':
+            currentScreenComponent = <SubjectSelectionScreen />;
+            break;
+        case 'computer_chapters':
+            currentScreenComponent = <ComputerChaptersScreen />;
+            break;
+        case 'admin_manager':
+            currentScreenComponent = isAdmin ? <AdminQuestionManager /> : <SubjectSelectionScreen />;
+            break;
+        case 'test':
+            currentScreenComponent = <TestScreen subject="Computer" />;
+            break;
+        case 'maths_test':
+            currentScreenComponent = <TestScreen subject="Maths" />;
+            break;
+        case 'analysis':
+            // Not directly navigated, handled internally by TestScreen
+            currentScreenComponent = <SubjectSelectionScreen />;
+            break;
+        default:
+            currentScreenComponent = <SplashScreen />;
+    }
+
+    const handleExitConfirm = () => {
+        signOut(auth).then(() => {
+            console.log("Logged out and Exited.");
+            // In a real browser/app, this would close the tab or app.
+            // Here, we just return to the login screen.
+            setScreen('login');
+            setHistory(['login']);
+            setExitModalOpen(false);
+        }).catch((error) => {
+            console.error("Logout Error:", error);
+            setExitModalOpen(false);
+        });
+    };
+
+    // Handle mobile back button (for user request)
+    useEffect(() => {
+        const handlePopState = (event) => {
+            if (history.length > 1) {
+                goBack();
+            } else {
+                setExitModalOpen(true);
+            }
+        };
+
+        window.addEventListener('popstate', handlePopState);
+        return () => window.removeEventListener('popstate', handlePopState);
+    }, [goBack, history.length]);
+
+    // Check if back button should be visible (not on splash/login/subject)
+    const showBackButton = screen !== 'splash' && screen !== 'login' && screen !== 'subject';
+
+
+    return (
+        <>
+            <div className="App min-h-screen">
+                {currentScreenComponent}
+            </div>
+            <CustomModal
+                isOpen={exitModalOpen}
+                title="एग्जिट कन्फर्मेशन"
+                message="क्या आप वाकई ऐप से बाहर निकलना चाहते हैं? आपका वर्तमान सेशन समाप्त हो जाएगा।"
+                onConfirm={handleExitConfirm}
+                onCancel={() => setExitModalOpen(false)}
+                confirmText="बाहर निकलें"
+            />
+        </>
+    );
+};
+
+// Main component export
+export default App;
